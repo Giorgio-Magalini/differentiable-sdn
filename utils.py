@@ -43,3 +43,83 @@ def load_homula_rir(rir_path, ula_index: int, sr: int, trim: bool=False):
     rir /= rir.norm()
 
     return rir
+
+def load_homula_rirs(rirs_paths, sr: int, trim: bool = False):
+    """
+    Load and preprocess Room Impulse Responses (RIRs) from HOMULA-RIR
+    for multiple sources.
+
+    Parameters:
+    rirs_paths : list or tuple of str
+        Paths to multichannel RIR WAV files, one per source.
+    sr : int
+        Target sampling rate.
+    trim : bool
+        If True, crop each RIR to its estimated reverberation time.
+
+    Returns:
+    torch.Tensor
+        Tensor of shape (num_sources, num_channels, num_samples)
+    """
+
+    if not isinstance(rirs_paths, (list, tuple)):
+        raise ValueError("rirs_paths must be a list or tuple of file paths")
+
+    processed_rirs = []
+
+    for rir_path in rirs_paths:
+
+        # --- Read WAV file ---
+        orig_sr, ula_rir = wavfile.read(rir_path)
+
+        # Convert to float tensor (channels, samples)
+        rirs = torch.tensor(ula_rir.T)
+
+        # Reorder channels to match CSV mic ordering (reverse X axis)
+        rirs = torch.flip(rirs, dims=[0])
+
+        # Resample to target sampling rate
+        rirs = F.resample(rirs, orig_sr, sr)
+
+        # Optional trimming to estimated reverberation time
+        if trim:
+            reverb_time = pra.experimental.rt60.measure_rt60(
+                rirs[0], fs=sr, decay_db=30
+            )
+            max_samples = int(reverb_time * sr)
+            rirs = rirs[:, :max_samples]
+
+        # Normalize each channel to unit L2 norm
+        norms = rirs.norm(dim=1, keepdim=True)
+        norms = torch.clamp(norms, min=1e-12)  # prevent division by zero
+        rirs = rirs / norms
+
+        processed_rirs.append(rirs)
+
+    # Ensure equal length across sources (truncate to the shortest if needed)
+    min_length = min(r.shape[1] for r in processed_rirs)
+    processed_rirs = [r[:, :min_length] for r in processed_rirs]
+
+    # Stack into (num_sources, num_channels, num_samples)
+    stacked_rirs = torch.stack(processed_rirs, dim=0)
+
+    return stacked_rirs
+
+def load_positions(csv_path):
+    """
+    Load microphone positions for a ULA from a CSV file.
+
+    Returns:
+        torch.Tensor of shape (N, 3)
+    """
+    mic_positions = []
+
+    with open(csv_path, 'r') as f:
+        f.readline()  # skip header
+        for line in f:
+            if not line.strip():
+                continue
+            x, y, z = map(float, line.strip().split(','))
+            mic_positions.append([x, y, z])
+
+    return torch.tensor(mic_positions, dtype=torch.float32)
