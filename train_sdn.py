@@ -103,7 +103,7 @@ def main(args):
     sdn_loss_functions = [  # (loss_name, loss_fn, lambda),
         ('EDC', losses.EDCLoss(), config['training']['lambda_edc']),
         ('EDR', losses.MelEDRLogLoss(sr=sr), config['training']['lambda_edr']),
-        ('EDP', losses.EDPLoss(sr=sr), config['training']['lambda_edp']),
+        # ('EDP', losses.EDPLoss(sr=sr), config['training']['lambda_edp']), removed: doesn't converge in training phase
     ]
 
     # Define the optimizer
