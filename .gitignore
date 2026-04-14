@@ -1,5 +1,3 @@
-/cache/
-/old_implementation/
-/toas_extraction_gifs_result/
-/notebooks/
-/saved_models/
+/tests
+/figures
+/saved_models
