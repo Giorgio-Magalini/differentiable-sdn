@@ -89,11 +89,6 @@ def load_homula_rirs(rirs_paths, sr: int, trim: bool = False):
             max_samples = int(reverb_time * sr)
             rirs = rirs[:, :max_samples]
 
-        # Normalize each channel to unit L2 norm
-        norms = rirs.norm(dim=1, keepdim=True)
-        norms = torch.clamp(norms, min=1e-12)  # prevent division by zero
-        rirs = rirs / norms
-
         processed_rirs.append(rirs)
 
     # Ensure equal length across sources (truncate to the shortest if needed)
