@@ -10,6 +10,7 @@ def energy_decay_curve(h: Tensor, return_db: bool = False) -> Tensor:
 
     Args:
         h: (T,) or (B, T)
+        return_db: whether to return EDC or not.
     Returns:
         EDC of same shape as input.
     """
@@ -26,6 +27,8 @@ def mel_energy_decay_relief(h: Tensor, sr: int, return_db: bool = True) -> Tenso
 
     Args:
         h: (T,) or (B, T)
+        sr: sampling rate
+        return_db: whether to return EDR or not.
     Returns:
         EDR of shape (n_mels, L) or (B, n_mels, L).
     """

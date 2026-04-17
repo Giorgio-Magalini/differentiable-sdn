@@ -8,7 +8,7 @@ from position_utils import get_distances
 
 
 class SDN(nn.Module):
-    '''Differential Scattering Delay Network'''
+    """Differential Scattering Delay Network"""
     def __init__(self,
                  room_dim,
                  N: int = 6,
