@@ -4,13 +4,20 @@ import pickle
 import argparse
 from pathlib import Path
 
-from utils import seed_everything
+import numpy
+from tqdm import trange, tqdm as tqdm_
+import math
+
+from utils import seed_everything, load_homula_rirs, load_positions
 from sdn import SDN
 import losses
 from calibration import load_and_calibration_pipeline
 
 
-SPLIT_MODE_CHOICES = ['even', 'first_half', 'second_half']
+SPLIT_MODE_CHOICES = [
+    'even', 'first_half', 'second_half',
+    'center_line_x', 'center_line_y', 'concentric_square',
+]
 
 def main(args):
     # Set seeds for reproducibility
@@ -51,31 +58,80 @@ def main(args):
     n_epochs = config['training']['n_epochs']
     batch_size = config['training']['batch_size']
     accumulation_factor = config['training']['accumulation_factor']
-    source_index = config['source_index']
+    dataset_type = config.get('dataset_type', 'real')
+    val_accumulation_factor = config['training']['val_accumulation_factor']
 
     # Factory kwargs used to move tensors/models to device and dtype consistently
     factory_kwargs = {"device": device, "dtype": dtype}
 
-    # Load RIRs (trimmed by estimated system delay), source position (estimated) and mic position (original)
-    true_rirs_both_channels, src_positions, mic_positions = load_and_calibration_pipeline(
-        rirs_path=[room['rir']['path_s1'], room['rir']['path_s2']],
-        mic_pos_path=room['mic_pos_path'],
-        src_pos_path=room['src_pos_path'],
-        c=c,
-        sr=sr
-    )
+    if dataset_type == 'simulated':
+        rirs = load_homula_rirs([room['rir_path']], sr=sr)  # (1, n_mics, T)
+        true_rirs = rirs[0]
+        mic_positions = load_positions(room['mic_pos_path'])
+        src_pos = torch.tensor(room['src_pos'])
 
-    # Select source and its corresponding RIRs
-    src_pos = src_positions[source_index].to(**factory_kwargs)
-    true_rirs = true_rirs_both_channels[source_index].to(**factory_kwargs)
+    elif dataset_type == 'real':
+        true_rirs_both, src_positions, mic_positions = load_and_calibration_pipeline(
+            rirs_path=[room['rir']['path_s1'], room['rir']['path_s2']],
+            mic_pos_path=room['mic_pos_path'],
+            src_pos_path=room['src_pos_path'],
+            c=c,
+            sr=sr,
+            flip=True
+        )
+        source_index = config['source_index']
+        src_pos = src_positions[source_index]
+        true_rirs = true_rirs_both[source_index]
+
+    else:
+        raise ValueError(f"Unknown dataset_type '{dataset_type}'. Must be 'real' or 'simulated'.")
+
+    true_rirs = true_rirs.to(**factory_kwargs)
     mic_positions = mic_positions.to(**factory_kwargs)
+    src_pos = src_pos.to(**factory_kwargs)
 
     # Build train/validation microphone index split
     n_mics = mic_positions.shape[0]
     if n_mics % 2 != 0:
         raise ValueError("Number of microphones must be even for this split.")
 
-    if split_mode == 'even':
+    train_indices = numpy.arange(n_mics)  # default fallback
+    if split_mode in ('center_line_x', 'center_line_y', 'concentric_square'):
+        if dataset_type != 'simulated':
+            raise ValueError(f"split_mode '{split_mode}' requires dataset_type 'simulated'.")
+
+        n_rows, n_cols = room['mic_array_grid']  # e.g. [20, 20]
+
+        if split_mode == 'center_line_x':
+            # Horizontal line at center row: fixed y, all x
+            center_row = n_rows // 2
+            train_indices = torch.tensor(
+                [center_row * n_cols + col for col in range(n_cols)], device=device
+            )
+
+        elif split_mode == 'center_line_y':
+            # Vertical line at center column: fixed x, all y
+            center_col = n_cols // 2
+            train_indices = torch.tensor(
+                [r * n_cols + center_col for r in range(n_rows)], device=device
+            )
+
+        elif split_mode == 'concentric_square':
+            # Inner square of side train_square_size, centered on the array
+            sq = config['training']['train_square_size']
+            row_start = (n_rows - sq) // 2
+            col_start = (n_cols - sq) // 2
+            train_indices = torch.tensor(
+                [(row_start + dr) * n_cols + (col_start + dc)
+                 for dr in range(sq) for dc in range(sq)],
+                device=device
+            )
+
+        train_mask = torch.zeros(n_mics, dtype=torch.bool, device=device)
+        train_mask[train_indices] = True
+        val_indices = torch.arange(n_mics, device=device)[~train_mask]
+
+    elif split_mode == 'even':
         train_indices = torch.arange(0, n_mics, 2, device=device)
         val_indices = torch.arange(1, n_mics, 2, device=device)
     elif split_mode == 'first_half':
@@ -88,6 +144,8 @@ def main(args):
         val_indices = torch.arange(0, half, device=device)
     else:
         raise ValueError("Invalid split_mode.")
+
+    val_batch_size = math.ceil(len(val_indices) / val_accumulation_factor)
 
     # Instantiate the input unit pulse
     x = torch.zeros(true_rirs.shape[-1]).to(**factory_kwargs)
@@ -117,8 +175,8 @@ def main(args):
     loss_history = {k[0]: [] for k in sdn_loss_functions}
 
     # Start training
-    for epoch in range(n_epochs):
-        print(f"Epoch {epoch + 1}/{n_epochs}")
+    for epoch in trange(n_epochs, desc="Epochs", leave=False):
+        # print(f"Epoch {epoch + 1}/{n_epochs}")
 
         sdn.train()
 
@@ -132,7 +190,10 @@ def main(args):
         # Reset gradients
         optimizer.zero_grad()
         # Loop over microphone batches
-        for step, i in enumerate(range(0, len(train_indices), batch_size)):
+        for step, i in enumerate(trange(
+            0, len(train_indices), batch_size,
+            desc=f"Epoch {epoch + 1} batches", leave=False
+            )):
 
             idx = perm[i:i + batch_size]
             mic_batch = mic_positions[idx]  # (B, 3)
@@ -163,16 +224,20 @@ def main(args):
         sdn.eval()
         with torch.no_grad():
             val_loss_terms = {k[0]: 0.0 for k in sdn_loss_functions}
+            n_val_batches = 0
 
-            # Run validation in a single batched forward pass
-            pred_rirs_val = sdn(x, src_pos, mic_positions[val_indices])  # (B_val, T)
-            true_rir_val = true_rirs[val_indices]
+            for j in range(0, len(val_indices), val_batch_size):
+                val_idx = val_indices[j:j + val_batch_size]
+                pred_rirs_val = sdn(x, src_pos, mic_positions[val_idx])
+                true_rir_val = true_rirs[val_idx]
 
-            for (loss_name, loss_fn, lmbda) in sdn_loss_functions:
-                loss_term = loss_fn(pred_rirs_val, true_rir_val)
-                val_loss_terms[loss_name] += loss_term.item()
+                for (loss_name, loss_fn, _) in sdn_loss_functions:
+                    val_loss_terms[loss_name] += loss_fn(pred_rirs_val, true_rir_val).item()
+                n_val_batches += 1
 
-            print("Validation losses:", val_loss_terms)
+            val_loss_terms = {k: v / n_val_batches for k, v in val_loss_terms.items()}
+            val_str = "  ".join(f"{k}: {v:.4e}" for k, v in val_loss_terms.items())
+            tqdm_.write(f"[Epoch {epoch + 1:>4}]  {val_str}")
 
         # Store epoch-averaged loss values
         for k in epoch_loss_terms:
@@ -184,7 +249,6 @@ def main(args):
         # Save loss history to disk for later analysis
         with open(save_dir / "loss_history.pickle", "wb") as f:
             pickle.dump(loss_history, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print('Model saved.')
 
     # Save model checkpoint for this epoch
     torch.save(sdn, save_dir.joinpath(f'sdn_epoch_{n_epochs}.pth'))

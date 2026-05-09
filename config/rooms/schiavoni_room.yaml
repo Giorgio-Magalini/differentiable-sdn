@@ -13,7 +13,7 @@ mic_pos:
 - 1.96
 - 1.2
 
-mic_pos_path: "data/homula-rir/pos-ULA.csv" # <---
+mic_pos_path: "data/homula-rir/pos-ULA.csv"
 
 src_pos_path: "data/homula-rir/pos-sources.csv"
 

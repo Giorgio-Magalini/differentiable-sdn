@@ -137,7 +137,7 @@ class SDN(nn.Module):
         # ========= Main simulation loop =========
         y = torch.zeros(B, T, **self.factory_kwargs)
         pp = torch.zeros(B, self.n_lines, 1, **self.factory_kwargs)
-        for k in trange(len(x)):
+        for k in trange(len(x), leave=False):
             xk = x[k].view(1, 1, 1).expand(B, 1, 1)  # (B, 1, 1) — batch-aware scalar
 
             # Add the (delayed) source signal to the global incident waves

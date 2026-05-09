@@ -40,10 +40,48 @@ def _select_topk_earliest_peak(signal, K):
 
     return int(np.min(topk_peaks))
 
+def _get_top_k_peaks(signal: np.ndarray, K: int, search_window_samples: int = 5) -> int:
+    """
+    Finds positive and negative peaks within a temporal window around the
+    global absolute maximum, then returns the top K indices ordered by magnitude.
+    """
+    # 1. Find the global absolute maximum as a reference point
+    abs_signal = np.abs(signal)
+    global_max_idx = np.argmax(abs_signal)
+
+    # 2. Define search boundaries (Region of Interest)
+    start_idx = max(0, global_max_idx - search_window_samples)
+    end_idx = min(len(signal), global_max_idx + 2)
+
+    roi = signal[start_idx:end_idx]
+
+    # 3. Detect peaks within the ROI
+    # We use a small height threshold relative to the ROI max to filter noise
+    roi_threshold = 0.33 * np.max(np.abs(roi))
+
+    pos_peaks, _ = find_peaks(roi, height=roi_threshold)
+    neg_peaks, _ = find_peaks(-roi, height=roi_threshold)
+
+    # Combine and shift indices back to the original signal coordinates
+    detected_peaks = np.concatenate([pos_peaks, neg_peaks]) + start_idx
+
+    # Ensure the global maximum is included even if find_peaks missed it
+    if global_max_idx not in detected_peaks:
+        detected_peaks = np.append(detected_peaks, global_max_idx)
+
+    # 4. Sort all detected peaks by absolute magnitude (descending)
+    peak_amplitudes = np.abs(signal[detected_peaks])
+    top_indices = np.argsort(peak_amplitudes)[-K:][::-1]
+
+    return int(np.min(detected_peaks[top_indices]))
+
+
+from scipy.signal import envelope
+
 def _extract_toas(
     rirs,
     sr=48000,
-    K=8,
+    K=4,
     enable_true_peak=True
 ):
     """
@@ -74,7 +112,9 @@ def _extract_toas(
 
             signal = rirs[:, channel_idx, src_idx]
 
-            peak_index = _select_topk_earliest_peak(signal, K)
+            signal = envelope(signal)
+
+            peak_index = int(np.argmax(np.abs(signal)))
 
             if enable_true_peak:
                 peak_index = _parabolic_interpolation(signal, int(peak_index))
@@ -82,7 +122,6 @@ def _extract_toas(
             toas[channel_idx, src_idx] = peak_index / sr
 
     return toas  # (M, K)
-
 
 
 def estimate_multiple_sources_shared_delay(
@@ -194,6 +233,63 @@ def estimate_multiple_sources_shared_delay(
 
     return estimated_positions, delta_hat
 
+def rescale_rirs_to_unit_excitation(
+    rirs: torch.Tensor,
+    mic_positions: torch.Tensor,
+    src_positions: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Rescale RIRs to be consistent with a unit-impulse excitation of the SDN.
+
+    For each source k, the reference microphone is selected as the one with
+    the highest peak amplitude (best SNR). The scaling factor is:
+
+        gain_k = g_SM[ref_k] / max(|RIR[ref_k]|)
+
+    where g_SM[ref_k] = 1 / d(src_k, mic_ref_k) is the direct-path gain at
+    the reference microphone (SDN spherical spreading convention).
+
+    A single scalar gain_k is applied uniformly to all channels of source k,
+    preserving inter-channel amplitude ratios and dataset normalization
+    homogeneity.
+
+    Parameters
+    ----------
+    rirs : torch.Tensor, shape (K, M, T)
+        Multichannel RIRs, one per source.
+    mic_positions : torch.Tensor, shape (M, 3)
+        Microphone 3-D coordinates [m].
+    src_positions : torch.Tensor, shape (K, 3)
+        Source 3-D coordinates [m].
+
+    Returns
+    -------
+    torch.Tensor, shape (K, M, T)
+        Rescaled RIRs.
+    """
+    rirs_out = rirs.clone()
+
+    for k in range(src_positions.shape[0]):
+        # Peak amplitude per microphone for source k: (M,)
+        peak_per_mic = torch.amax(torch.abs(rirs[k]), dim=-1)
+
+        # Reference mic: highest peak amplitude
+        ref_mic = int(torch.argmax(peak_per_mic).item())
+
+        # Direct-path gain at reference mic (SDN convention: 1/d)
+        d_ref = torch.norm(src_positions[k] - mic_positions[ref_mic]).item()
+        if d_ref < 1e-6:
+            raise ValueError(
+                f"Source {k} is coincident with reference microphone (mic {ref_mic})."
+            )
+        g_SM_ref = 1.0 / d_ref
+
+        # Combined scale factor
+        peak_ref        = peak_per_mic[ref_mic].item()
+        gain            = g_SM_ref / peak_ref
+        rirs_out[k]     = rirs[k] * gain
+
+    return rirs_out
 
 def _apply_delay(rirs, delay_samples):
     """
@@ -218,6 +314,7 @@ def load_and_calibration_pipeline(
     src_pos_path,
     c=343.0,
     sr=48000,
+    flip: bool = False,
 ):
     rirs_paths = [Path(p) for p in rirs_path]
     src_pos_path = Path(src_pos_path)
@@ -231,22 +328,25 @@ def load_and_calibration_pipeline(
         rirs_paths[0].stem + "_system_delay_meters"
     ).with_suffix(".txt")
 
-    # ------------------------------------------------------------------ #
-    # Step 1: If delay and calibrated positions already exist, load and apply
-    # ------------------------------------------------------------------ #
-    if delay_path.exists() and calibrated_src_pos_path.exists():
-        mic_positions            = load_positions(mic_pos_path)
-        delay_meters             = float(open(delay_path).read().strip())
-        delay_samples            = int(round(delay_meters / c * sr))
-        rirs                     = load_homula_rirs(rirs_path, sr=sr, trim=True)
-        calibrated_src_positions = load_positions(calibrated_src_pos_path)
-        calibrated_rirs          = _apply_delay(rirs, delay_samples)
-        return calibrated_rirs, calibrated_src_positions, mic_positions
+    # # ------------------------------------------------------------------ #
+    # # Step 1: If delay and calibrated positions already exist, load and apply
+    # # ------------------------------------------------------------------ #
+    # if delay_path.exists() and calibrated_src_pos_path.exists():
+    #     mic_positions            = load_positions(mic_pos_path)
+    #     delay_meters             = float(open(delay_path).read().strip())
+    #     delay_samples            = int(round(delay_meters / c * sr))
+    #     rirs                     = load_homula_rirs(rirs_path, sr=sr, trim=True, flip=flip)
+    #     calibrated_src_positions = load_positions(calibrated_src_pos_path)
+    #     calibrated_rirs          = _apply_delay(rirs, delay_samples)
+    #     calibrated_rirs = rescale_rirs_to_unit_excitation(
+    #         calibrated_rirs, mic_positions, calibrated_src_positions
+    #     )
+    #     return calibrated_rirs, calibrated_src_positions, mic_positions
 
     # ------------------------------------------------------------------ #
     # Step 2: Load RIRs, mic positions, and source positions
     # ------------------------------------------------------------------ #
-    rirs          = load_homula_rirs(rirs_path, sr=sr, trim=True)   # (M, T)
+    rirs          = load_homula_rirs(rirs_path, sr=sr, trim=True, flip=flip)   # (M, T)
     mic_positions = load_positions(mic_pos_path)          # (M, 3)
     src_positions = load_positions(src_pos_path)          # (K, 3)
 
@@ -296,5 +396,8 @@ def load_and_calibration_pipeline(
     # ------------------------------------------------------------------ #
     calibrated_rirs          = _apply_delay(rirs, delay_samples)
     calibrated_src_positions = torch.tensor(estimated_positions_3d, dtype=torch.float32)
+    calibrated_rirs = rescale_rirs_to_unit_excitation(
+        calibrated_rirs, mic_positions, calibrated_src_positions
+    )
 
     return calibrated_rirs, calibrated_src_positions, mic_positions

@@ -44,7 +44,7 @@ def load_homula_rir(rir_path, ula_index: int, sr: int, trim: bool=False):
 
     return rir
 
-def load_homula_rirs(rirs_paths, sr: int, trim: bool = False):
+def load_homula_rirs(rirs_paths, sr: int, trim: bool = False, flip: bool = False):
     """
     Load and preprocess Room Impulse Responses (RIRs) from HOMULA-RIR
     for multiple sources.
@@ -75,8 +75,9 @@ def load_homula_rirs(rirs_paths, sr: int, trim: bool = False):
         # Convert to float tensor (channels, samples)
         rirs = torch.tensor(ula_rir.T)
 
-        # Reorder channels to match CSV mic ordering (reverse X axis)
-        rirs = torch.flip(rirs, dims=[0])
+        if flip:
+            # Reorder channels to match CSV mic ordering (reverse X axis)
+            rirs = torch.flip(rirs, dims=[0])
 
         # Resample to target sampling rate
         rirs = F.resample(rirs, orig_sr, sr)
